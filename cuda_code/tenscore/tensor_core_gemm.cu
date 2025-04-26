@@ -15,41 +15,46 @@ void check(cudaError_t err, const char* func, const char* file, int line) {
 }
 
 // CUDA 核函数：使用 Tensor Core 进行矩阵乘法 D = A * B + C
-__global__ void wmma_matrix_mult(half* a, half* b, float* c, float* d, int M, int N, int K) {
-    // 声明 WMMA 碎片
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> a_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> b_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> c_frag;
+__global__ void wmma_matrix_mult_large(half* a, half* b, float* c, float* d, 
+    int M, int N, int K) {
+// 声明WMMA片段
+nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> a_frag;
+nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> b_frag;
+nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc_frag;
+nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> c_frag;
 
-    // 初始化累加器碎片为 0
-    nvcuda::wmma::fill_fragment(acc_frag, 0.0f);
+// 计算当前warp处理的块坐标
+int warpM = (blockIdx.y * blockDim.y + threadIdx.y) / warpSize;
+int warpN = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // 加载矩阵 A 和 B 到碎片
-    nvcuda::wmma::load_matrix_sync(a_frag, a, 16); // 步长为 16
-    nvcuda::wmma::load_matrix_sync(b_frag, b, 16); // 步长为 16
+if (warpM >= M / 16 || warpN >= N / 16) return;
 
-    // 执行矩阵乘法：acc = A * B
-    nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+// 初始化累加器
+nvcuda::wmma::fill_fragment(acc_frag, 0.0f);
 
-    // 加载矩阵 C 到碎片
-    nvcuda::wmma::load_matrix_sync(c_frag, c, 16, nvcuda::wmma::mem_row_major);
-
-    // 累加 C 到 acc：acc += C
-    for (int i = 0; i < acc_frag.num_elements; i++) {
-        acc_frag.x[i] += c_frag.x[i];
-    }
-
-    // 存储结果到 D
-    nvcuda::wmma::store_matrix_sync(d, acc_frag, 16, nvcuda::wmma::mem_row_major);
+// 分块矩阵乘法
+for (int k = 0; k < K / 16; ++k) {
+nvcuda::wmma::load_matrix_sync(a_frag, a + warpM * 16 * K + k * 16, K);
+nvcuda::wmma::load_matrix_sync(b_frag, b + k * 16 * N + warpN * 16, N);
+nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
 }
 
-// 主机函数：初始化矩阵并调用核函数
+// 加载C的块（添加布局参数）
+nvcuda::wmma::load_matrix_sync(c_frag, c + warpM * 16 * N + warpN * 16, N, nvcuda::wmma::mem_row_major);
+
+// 累加C到结果
+for (int i = 0; i < acc_frag.num_elements; i++) {
+acc_frag.x[i] += c_frag.x[i];
+}
+
+// 存储结果到D（添加布局参数）
+nvcuda::wmma::store_matrix_sync(d + warpM * 16 * N + warpN * 16, acc_frag, N, nvcuda::wmma::mem_row_major);
+}// 主机函数：初始化矩阵并调用核函数
 int main() {
     // 矩阵尺寸
-    const int M = 16;
-    const int N = 16;
-    const int K = 16;
+    const int M = 1024;
+    const int N = 128;
+    const int K = 512;
 
     // 主机端矩阵
     float* h_A = new float[M * K];
@@ -81,12 +86,12 @@ int main() {
     CHECK_CUDA_ERROR(cudaMemcpy(d_B, h_B_fp16, K * N * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA_ERROR(cudaMemcpy(d_C, h_C, M * N * sizeof(float), cudaMemcpyHostToDevice));
 
-    // 设置线程块和网格
-    dim3 threadsPerBlock(32, 1); // 一个 warp 有 32 个线程
-    dim3 blocksPerGrid(1, 1);    // 单块处理 16x16 矩阵
+    // 设置执行配置
+    dim3 threadsPerBlock(16, 4);  // 每个block有4个warp（16x4=64线程）
+    dim3 blocksPerGrid((N + 15) / 16, (M + 15) / (16 * threadsPerBlock.y));
 
     // 调用核函数
-    wmma_matrix_mult<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, d_D, M, N, K);
+    wmma_matrix_mult_large<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, d_D, M, N, K);
     CHECK_CUDA_ERROR(cudaGetLastError());
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
