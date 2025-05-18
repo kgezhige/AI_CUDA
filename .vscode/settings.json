@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+        "*.cmake": "makefile",
+        "iostream": "cpp",
+            "*.cu": "cuda-cpp",
+            "*.cuh": "cuda-cpp"
+    },
+    "cmake.sourceDirectory": "/home/xukaili/Document/work/feiniao/flashattn_grok",
+    
+        "C_Cpp.default.includePath": [
+            "${workspaceFolder}/include",
+            "/usr/local/cuda/include"
+        ],
+        "cmake.configureOnOpen": true,
+    
+}

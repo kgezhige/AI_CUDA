@@ -37,4 +37,4 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     )
 endif()
 
-# sudo /opt/nvidia/nsight-compute/2023.1.1/target/linux-desktop-glibc_2_11_3-x64/ncu --config-file off --export "/home/xukaili/Document/NVIDIA Nsight Compute/block32_tread_64" --force-overwrite --set full /home/xukaili/Document/work/feiniao/flashattn_grok/build/flashattn_grok
+# sudo /opt/nvidia/nsight-compute/2023.1.1/target/linux-desktop-glibc_2_11_3-x64/ncu --config-file off --export "/home/xukaili/Document/NVIDIA Nsight Compute/block40_thread_64_N_128" --force-overwrite --set full /home/xukaili/Document/work/feiniao/flashattn_grok/build/flashattn_grok
