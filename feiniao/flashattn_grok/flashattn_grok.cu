@@ -96,6 +96,9 @@ __global__ void flashAttentionKernel(
         __shared__ float shared_max[32];
         __shared__ float shared_sum[32];
         __shared__ float shared_new_m;
+        __shared__ float maxold; //全局最大值
+        shared_new_m = 0;
+        maxold = 0;
         if (threadIdx.x < block_size) {
             shared_max[threadIdx.x] = -1e10;
             shared_sum[threadIdx.x] = 0.0;
@@ -105,7 +108,6 @@ __global__ void flashAttentionKernel(
         // 即每一行都有一个寄存器变量row_max存储最大值，最后放在对应线程的 shared_max[threadIdx.x]
         // 线程 0：计算 s_S[0 * 32 + 0] 到 s_S[0 * 32 + 31] 的最大值，存入 shared_max[0]。
         // 线程 1：计算 s_S[1 * 32 + 0] 到 s_S[1 * 32 + 31] 的最大值，存入 shared_max[1]。 线程 32 到 63：空闲，不执行任何操作。
-        float new_m = m;
         for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
             float row_max = -1e10;
             for (int j = 0; j < block_size; j++) {
@@ -120,56 +122,67 @@ __global__ void flashAttentionKernel(
         // 比如score中32x32矩阵，虽然每一行的最大值可能不一样，但是总的来说，每个元素都除以了小块的最大值，softmax分子分母也都是同时除以了最大值。所以最终的softmax都是不变的。
         // 计算 s_S 每行的最大值（row_max），存储到 shared_max。 聚合所有行的最大值，更新全局最大值 new_m。将结果存储到 shared_new_m，供后续 softmax 使用。        
         __syncthreads();
+        maxold = shared_new_m
         if (threadIdx.x == 0) {
             new_m = m;
             for (int i = 0; i < block_size; i++) {
                 new_m = fmaxf(new_m, shared_max[i]);
             }
-            shared_new_m = new_m;
+            shared_new_m = new_m;    //当前字块的最大值，也是全局的最大值
         }
         // 这里计算分块分数矩阵s(32,32)的每一行的求和。每个线程负责一行32元素取e^{val-new_m}后的求和。线程 32 到 63：空闲
 
         __syncthreads();
-        new_m = shared_new_m;
         // 
         for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
             float row_sum = 0.0; //寄存器变量，存储中间求和结果
             for (int j = 0; j < block_size; j++) {
                 float val = s_S[i * block_size + j];
                 if (isfinite(val)) {
-                    s_S[i * block_size + j] = expf(val - new_m);
-                    row_sum += s_S[i * block_size + j];
+                    s_S[i * block_size + j] = expf(val - shared_new_m);
+                    row_sum += s_S[i * block_size + j];  // 此时row sum 相当于lb 当前一块内的值求和
                 } else {
                     s_S[i * block_size + j] = 0.0;
                 }
             }
-            shared_sum[threadIdx.x] = row_sum;
+            // 更新全局累积和 l_i
+            float l_old = shared_sum[threadIdx.x]; // 之前子块的累积和
+            // float m_i = fmaxf(old_m, mb);       // 全局最大值
+            // 计算 lg
+            shared_sum[threadIdx.x] = l_old * expf(maxold - shared_new_m) + row_sum //* expf(mb - m_i);            
         }
-        __syncthreads();
-        // 归一化 s_S
-        // 每一行的元素除以此行的和。得到softmax
-        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
-            float row_sum = shared_sum[threadIdx.x];
-            if (row_sum == 0.0) row_sum = 1.0;
-            for (int j = 0; j < block_size; j++) {
-                s_S[i * block_size + j] /= row_sum;
-            }
-        }
+        // __syncthreads();
+        // // 归一化 s_S
+        // // 每一行的元素除以此行的和。得到softmax
+        // for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
+        //     float row_sum = shared_sum[threadIdx.x];
+        //     if (row_sum == 0.0) row_sum = 1.0;
+        //     for (int j = 0; j < block_size; j++) {
+        //         s_S[i * block_size + j] /= row_sum;
+        //     }
+        // }
         __syncthreads();
 
         // 更新 O
-        float old_m = m;
+        // 这里计算分块分数矩阵输出O 的每一行的输出o。每个线程负责一行32元素的O输出计算。线程 32 到 63：空闲
+
+        // 更新输出 o
+        // float old_m = m; // 保存当前块前的全局最大值
         for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
             if (row + i >= N) continue;
+            float l_old = shared_sum[threadIdx.x]; // 获取当前累积和（包含之前块的信息）
+            float m_i = fmaxf(old_m, new_m);       // 更新全局最大值
             for (int k = 0; k < d; k++) {
-                float sum = 0.0;
+                float Ob = 0.0; // 当前子块的 O_b[i]
                 for (int j = 0; j < block_size; j++) {
-                    sum += s_S[i * block_size + j] * s_V[j * d + k];
+                    Ob += s_S[i * block_size + j] * s_V[j * d + k]; // 使用未归一化的 s_S
                 }
-                o[threadIdx.x * d + k] = o[threadIdx.x * d + k] * expf(old_m - new_m) + sum;
+                // 递推更新 o
+                o[threadIdx.x * d + k] = (o[threadIdx.x * d + k] * expf(maxold - shared_new_m)) + (Ob) //* expf(new_m - m_i));
             }
         }
-        m = new_m;
+
+        // m = new_m;
         __syncthreads();
 
         // 调试输出
@@ -183,13 +196,21 @@ __global__ void flashAttentionKernel(
         __syncthreads();
     }
 
-    // 写回 O
+    __syncthreads();
     for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
         if (row + i >= N) continue;
+        float l_i = shared_sum[threadIdx.x]; // 全局累积和
         for (int k = 0; k < d; k++) {
-            O[(row + i) * d + k] = o[threadIdx.x * d + k];
+            O[(row + i) * d + k] = o[threadIdx.x * d + k] / l_i; // 写入最终输出
         }
     }
+    // // 写回 O
+    // for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
+    //     if (row + i >= N) continue;
+    //     for (int k = 0; k < d; k++) {
+    //         O[(row + i) * d + k] = o[threadIdx.x * d + k];
+    //     }
+    // }
 }
 
 void flashAttention(float* Q, float* K, float* V, float* O, int N, int d) {
